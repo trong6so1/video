@@ -184,22 +184,71 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
 
     # Stage 5: 75% - Dịch phụ đề sang tiếng Việt subtitle_vi.srt
     await report_progress("Dịch phụ đề sang tiếng Việt", 75, None)
-    translator = GoogleTranslator(source="zh-CN", target="vi")
     
     def translate_texts():
         segments_vi = []
-        for seg in segments_zh:
+        texts_to_translate = [seg["text"] for seg in segments_zh]
+        
+        # Dùng Google Translate API clients5 kết hợp fallback MyMemory
+        translated_results = []
+        for i in range(0, len(texts_to_translate), 20):
+            chunk = texts_to_translate[i:i+20]
+            combined = "\n===\n".join(chunk)
+            chunk_translated = None
             try:
-                translated_text = translator.translate(seg["text"]) if seg["text"] else ""
-            except Exception:
-                translated_text = seg["text"]
+                url = "https://clients5.google.com/translate_a/t"
+                params = {"client": "dict-chrome-ex", "sl": "zh-CN", "tl": "vi", "q": combined}
+                r = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+                if r.status_code == 200:
+                    data = r.json()
+                    res_str = data[0] if isinstance(data, list) else str(data)
+                    parts = res_str.split("\n===\n")
+                    if len(parts) == len(chunk):
+                        chunk_translated = [p.strip() for p in parts]
+            except Exception as e:
+                print(f"Batch translate error: {e}")
+
+            if not chunk_translated:
+                # Fallback dịch từng câu
+                chunk_translated = []
+                for c in chunk:
+                    if not c.strip():
+                        chunk_translated.append("")
+                        continue
+                    trans_item = None
+                    # Thử clients5
+                    try:
+                        r = requests.get("https://clients5.google.com/translate_a/t",
+                                         params={"client": "dict-chrome-ex", "sl": "zh-CN", "tl": "vi", "q": c},
+                                         headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+                        if r.status_code == 200:
+                            data = r.json()
+                            trans_item = data[0] if isinstance(data, list) else str(data)
+                    except Exception:
+                        pass
+                    
+                    # Thử MyMemory nếu vẫn chưa có
+                    if not trans_item:
+                        try:
+                            from deep_translator import MyMemoryTranslator
+                            m = MyMemoryTranslator(source="zh-CN", target="vi-VN")
+                            trans_item = m.translate(c)
+                        except Exception:
+                            trans_item = c
+                    
+                    chunk_translated.append(trans_item or c)
+
+            translated_results.extend(chunk_translated)
+
+        for seg, trans_text in zip(segments_zh, translated_results):
             segments_vi.append({
                 "start": seg["start"],
                 "end": seg["end"],
-                "text": translated_text or ""
+                "text": trans_text or ""
             })
         return segments_vi
 
+    loop = asyncio.get_event_loop()
     segments_vi = await loop.run_in_executor(None, translate_texts)
     subtitle_vi_path = task_dir / "subtitle_vi.srt"
     write_srt(segments_vi, str(subtitle_vi_path))
@@ -211,9 +260,55 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
         full_vi_text = "Video không có phụ đề."
 
     dub_vi_path = task_dir / "dub_vi.mp3"
-    selected_voice = voice if voice else "vi-VN-HoaiMyNeural"
-    communicate = edge_tts.Communicate(full_vi_text, selected_voice)
-    await communicate.save(str(dub_vi_path))
+    selected_voice = voice if voice and "NamMinh" in voice else "vi-VN-NamMinhNeural"
+    
+    # Chia nhỏ văn bản thành các đoạn tối đa 600 ký tự để tránh lỗi websocket timeout của Edge-TTS
+    words = full_vi_text.split()
+    chunks = []
+    current_chunk = []
+    current_len = 0
+    for w in words:
+        if current_len + len(w) + 1 > 600:
+            chunks.append(" ".join(current_chunk))
+            current_chunk = [w]
+            current_len = len(w)
+        else:
+            current_chunk.append(w)
+            current_len += len(w) + 1
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+
+    # Tạo file audio cho từng chunk và nối lại bằng ffmpeg concat
+    chunk_files = []
+    for idx, chunk in enumerate(chunks):
+        c_path = task_dir / f"chunk_{idx}.mp3"
+        try:
+            communicate = edge_tts.Communicate(chunk, selected_voice)
+            await communicate.save(str(c_path))
+            if c_path.exists() and c_path.stat().st_size > 0:
+                chunk_files.append(c_path)
+        except Exception as e:
+            print(f"Error generating chunk {idx}: {e}")
+
+    if not chunk_files:
+        raise RuntimeError("Không thể tạo giọng đọc lồng tiếng qua Edge-TTS.")
+
+    if len(chunk_files) == 1:
+        chunk_files[0].rename(dub_vi_path)
+    else:
+        # Nối các file mp3
+        concat_list = task_dir / "concat.txt"
+        with open(concat_list, "w", encoding="utf-8") as f:
+            for cf in chunk_files:
+                f.write(f"file '{cf.name}'\n")
+        ffmpeg_concat = [
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(concat_list),
+            "-c", "copy",
+            str(dub_vi_path)
+        ]
+        proc = await asyncio.create_subprocess_exec(*ffmpeg_concat)
+        await proc.communicate()
 
     # Stage 7: 95% - Ghép audio lồng tiếng, burn hardsub vào output_vi.mp4
     await report_progress("Ghép audio lồng tiếng và nhúng phụ đề vào video", 95, None)
