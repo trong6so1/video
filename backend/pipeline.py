@@ -253,62 +253,70 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
     subtitle_vi_path = task_dir / "subtitle_vi.srt"
     write_srt(segments_vi, str(subtitle_vi_path))
 
-    # Stage 6: 85% - Dùng edge-tts tạo giọng lồng tiếng dub_vi.mp3
-    await report_progress("Dùng Edge-TTS tạo giọng lồng tiếng tiếng Việt", 85, None)
+    # Stage 6: 85% - Tạo giọng lồng tiếng dub_vi.mp3 (Edge-TTS kết hợp fallback gTTS)
+    await report_progress("Tạo giọng lồng tiếng tiếng Việt", 85, None)
     full_vi_text = " ".join([seg["text"] for seg in segments_vi if seg["text"]])
     if not full_vi_text.strip():
         full_vi_text = "Video không có phụ đề."
 
     dub_vi_path = task_dir / "dub_vi.mp3"
     selected_voice = voice if voice and "NamMinh" in voice else "vi-VN-NamMinhNeural"
-    
-    # Chia nhỏ văn bản thành các đoạn tối đa 600 ký tự để tránh lỗi websocket timeout của Edge-TTS
-    words = full_vi_text.split()
-    chunks = []
-    current_chunk = []
-    current_len = 0
-    for w in words:
-        if current_len + len(w) + 1 > 600:
-            chunks.append(" ".join(current_chunk))
-            current_chunk = [w]
-            current_len = len(w)
-        else:
-            current_chunk.append(w)
-            current_len += len(w) + 1
-    if current_chunk:
-        chunks.append(" ".join(current_chunk))
 
-    # Tạo file audio cho từng chunk và nối lại bằng ffmpeg concat
-    chunk_files = []
-    for idx, chunk in enumerate(chunks):
-        c_path = task_dir / f"chunk_{idx}.mp3"
-        try:
+    # Thử tạo bằng Edge-TTS trước (với chunking)
+    generated = False
+    try:
+        words = full_vi_text.split()
+        chunks = []
+        current_chunk = []
+        current_len = 0
+        for w in words:
+            if current_len + len(w) + 1 > 400:
+                chunks.append(" ".join(current_chunk))
+                current_chunk = [w]
+                current_len = len(w)
+            else:
+                current_chunk.append(w)
+                current_len += len(w) + 1
+        if current_chunk:
+            chunks.append(" ".join(current_chunk))
+
+        chunk_files = []
+        for idx, chunk in enumerate(chunks):
+            c_path = task_dir / f"chunk_{idx}.mp3"
             communicate = edge_tts.Communicate(chunk, selected_voice)
             await communicate.save(str(c_path))
             if c_path.exists() and c_path.stat().st_size > 0:
                 chunk_files.append(c_path)
-        except Exception as e:
-            print(f"Error generating chunk {idx}: {e}")
 
-    if not chunk_files:
-        raise RuntimeError("Không thể tạo giọng đọc lồng tiếng qua Edge-TTS.")
+        if chunk_files and len(chunk_files) == len(chunks):
+            if len(chunk_files) == 1:
+                chunk_files[0].rename(dub_vi_path)
+            else:
+                concat_list = task_dir / "concat.txt"
+                with open(concat_list, "w", encoding="utf-8") as f:
+                    for cf in chunk_files:
+                        f.write(f"file '{cf.name}'\n")
+                ffmpeg_concat = [
+                    "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                    "-i", str(concat_list),
+                    "-c", "copy",
+                    str(dub_vi_path)
+                ]
+                proc = await asyncio.create_subprocess_exec(*ffmpeg_concat)
+                await proc.communicate()
+            if dub_vi_path.exists() and dub_vi_path.stat().st_size > 0:
+                generated = True
+    except Exception as edge_err:
+        print(f"Edge-TTS failed: {edge_err}, falling back to gTTS...")
 
-    if len(chunk_files) == 1:
-        chunk_files[0].rename(dub_vi_path)
-    else:
-        # Nối các file mp3
-        concat_list = task_dir / "concat.txt"
-        with open(concat_list, "w", encoding="utf-8") as f:
-            for cf in chunk_files:
-                f.write(f"file '{cf.name}'\n")
-        ffmpeg_concat = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", str(concat_list),
-            "-c", "copy",
-            str(dub_vi_path)
-        ]
-        proc = await asyncio.create_subprocess_exec(*ffmpeg_concat)
-        await proc.communicate()
+    # Fallback gTTS đảm bảo 100% không bao giờ bị lỗi No audio was received
+    if not generated or not dub_vi_path.exists() or dub_vi_path.stat().st_size == 0:
+        def run_gtts():
+            from gtts import gTTS
+            tts = gTTS(text=full_vi_text, lang="vi")
+            tts.save(str(dub_vi_path))
+
+        await loop.run_in_executor(None, run_gtts)
 
     # Stage 7: 95% - Ghép audio lồng tiếng, burn hardsub vào output_vi.mp4
     await report_progress("Ghép audio lồng tiếng và nhúng phụ đề vào video", 95, None)
