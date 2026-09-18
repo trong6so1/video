@@ -257,9 +257,38 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
     subtitle_vi_path = task_dir / "subtitle_vi.srt"
     write_srt(segments_vi, str(subtitle_vi_path))
 
-    # Stage 6: 85% - Tạo giọng lồng tiếng đồng bộ theo từng câu thoại (Matching từng câu)
-    await report_progress("Tạo giọng lồng tiếng khớp chính xác từng câu thoại", 85, None)
+    # Stage 6: 85% - Tạo giọng lồng tiếng đồng bộ theo cụm phát âm tự nhiên (Natural Speech Clusters)
+    await report_progress("Tạo giọng lồng tiếng đồng bộ chính xác với nhân vật", 85, None)
     dub_vi_path = task_dir / "dub_vi.mp3"
+
+    # Gom các câu thoại thành các cụm phát âm tự nhiên theo khoảng lặng thoại gốc
+    clusters = []
+    curr_cluster = []
+    for seg in segments_vi:
+        txt = seg["text"].strip()
+        if not txt:
+            continue
+        if curr_cluster:
+            gap = seg["start"] - curr_cluster[-1]["end"]
+            # Nếu nhân vật dừng nói > 0.4s hoặc cụm thoại dài hơn 7.5s thì tách cụm mới
+            if gap > 0.4 or (seg["end"] - curr_cluster[0]["start"] > 7.5):
+                clusters.append({
+                    "start": curr_cluster[0]["start"],
+                    "end": curr_cluster[-1]["end"],
+                    "text": ". ".join([c["text"].rstrip(".") for c in curr_cluster])
+                })
+                curr_cluster = [seg]
+            else:
+                curr_cluster.append(seg)
+        else:
+            curr_cluster.append(seg)
+
+    if curr_cluster:
+        clusters.append({
+            "start": curr_cluster[0]["start"],
+            "end": curr_cluster[-1]["end"],
+            "text": ". ".join([c["text"].rstrip(".") for c in curr_cluster])
+        })
 
     def generate_synced_audio():
         from gtts import gTTS
@@ -270,19 +299,33 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
         filter_parts = []
         mix_inputs = []
 
-        for idx, seg in enumerate(segments_vi):
-            txt = seg["text"].strip()
+        def build_atempo(ratio: float) -> str:
+            # atempo trong ffmpeg từ 0.5 đến 2.0; ghép chuỗi nếu cần tăng tốc cao hơn
+            ratio = max(0.65, min(ratio, 3.2))
+            filters = []
+            curr = ratio
+            while curr > 2.0:
+                filters.append("atempo=2.0")
+                curr /= 2.0
+            while curr < 0.5:
+                filters.append("atempo=0.5")
+                curr /= 0.5
+            filters.append(f"atempo={curr:.3f}")
+            return ",".join(filters)
+
+        for idx, cl in enumerate(clusters):
+            txt = cl["text"].strip()
             if not txt:
                 continue
-            raw_seg_path = seg_dir / f"seg_raw_{idx}.mp3"
-            norm_seg_path = seg_dir / f"seg_norm_{idx}.wav"
+            raw_seg_path = seg_dir / f"cl_raw_{idx}.mp3"
+            norm_seg_path = seg_dir / f"cl_norm_{idx}.wav"
             
-            # Tạo giọng đọc cho từng câu riêng biệt
+            # Tạo audio gTTS cho cụm câu hoàn chỉnh (đầy đủ ngữ điệu tự nhiên)
             tts = gTTS(text=txt, lang="vi")
             tts.save(str(raw_seg_path))
             
-            # Tính toán thời lượng gốc của câu thoại
-            target_duration = max(seg["end"] - seg["start"], 0.8)
+            # Tính thời lượng gốc của cụm thoại
+            target_duration = max(cl["end"] - cl["start"], 0.8)
             probe_cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(raw_seg_path)]
             probe_res = subprocess.run(probe_cmd, capture_output=True, text=True)
             try:
@@ -290,21 +333,23 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
             except Exception:
                 actual_duration = target_duration
             
-            # Điều chỉnh tốc độ (atempo) để câu tiếng Việt khớp vừa vặn với câu gốc
+            # Khớp tốc độ nói chính xác 1:1 với thời lượng nhân vật nói
             speed_ratio = actual_duration / target_duration
-            speed_ratio = max(0.85, min(speed_ratio, 1.75))
+            atempo_filter = build_atempo(speed_ratio)
             
+            # Cắt bỏ khoảng im lặng đầu file (nếu có) và áp dụng atempo
             speed_cmd = [
                 "ffmpeg", "-y", "-i", str(raw_seg_path),
-                "-filter:a", f"atempo={speed_ratio:.2f}",
+                "-filter:a", f"silenceremove=start_periods=1:start_duration=0.01:start_threshold=-45dB,{atempo_filter}",
                 "-ar", "44100", "-ac", "1",
                 str(norm_seg_path)
             ]
             subprocess.run(speed_cmd, capture_output=True)
 
-            delay_ms = int(seg["start"] * 1000)
+            delay_ms = int(cl["start"] * 1000)
             inputs.extend(["-i", str(norm_seg_path)])
-            filter_parts.append(f"[{len(inputs)//2 - 1}:a]adelay={delay_ms}|{delay_ms}[a{idx}]")
+            in_idx = len(inputs) // 2 - 1
+            filter_parts.append(f"[{in_idx}:a]adelay={delay_ms}|{delay_ms}[a{idx}]")
             mix_inputs.append(f"[a{idx}]")
 
         if not mix_inputs:
