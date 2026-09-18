@@ -4,8 +4,10 @@ import asyncio
 import subprocess
 import uuid
 import datetime
+import urllib.parse
 from pathlib import Path
 from typing import Callable, Awaitable, Optional
+import requests
 from faster_whisper import WhisperModel
 from deep_translator import GoogleTranslator
 import edge_tts
@@ -13,12 +15,85 @@ import edge_tts
 ProgressCallback = Callable[[str, int, Optional[dict]], Awaitable[None]]
 
 def extract_douyin_url(raw_text: str) -> str:
-    """Trích xuất link URL sạch từ văn bản chia sẻ của Douyin."""
+    """Trích xuất và chuẩn hóa link URL Douyin (bao gồm cả dạng jingxuan?modal_id= và shortlink)."""
     url_match = re.search(r'(https?://[^\s]+)', raw_text)
     if not url_match:
         raise ValueError("Không tìm thấy đường dẫn hợp lệ trong chuỗi nhập vào.")
     url = url_match.group(1).rstrip('/')
+    
+    # Chuẩn hóa nếu là URL chứa modal_id (VD: https://www.douyin.com/jingxuan?modal_id=7674948813861211430)
+    parsed = urllib.parse.urlparse(url)
+    qs = urllib.parse.parse_qs(parsed.query)
+    modal_id = qs.get("modal_id", [None])[0]
+    if modal_id:
+        return f"https://www.douyin.com/video/{modal_id}"
+        
     return url
+
+def download_douyin_video(url: str, output_path: str):
+    """Tải video Douyin bằng cách lấy dynamic ttwid và gọi API aweme/detail, fallback qua yt-dlp."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Referer": "https://www.douyin.com/",
+        "Accept": "application/json, text/plain, */*",
+    }
+    
+    # 1. Trích xuất aweme_id
+    video_id = None
+    parsed = urllib.parse.urlparse(url)
+    id_match = re.search(r'/video/(\d+)', parsed.path)
+    if id_match:
+        video_id = id_match.group(1)
+    else:
+        # Nếu là link rút gọn hoặc dạng khác, resolve redirect
+        try:
+            r = requests.get(url, headers=headers, allow_redirects=True, timeout=10)
+            id_match = re.search(r'/video/(\d+)', r.url)
+            if id_match:
+                video_id = id_match.group(1)
+        except Exception:
+            pass
+
+    # 2. Thử tải trực tiếp qua aweme API với dynamic ttwid cookie
+    if video_id:
+        try:
+            session = requests.Session()
+            session.get("https://live.douyin.com/", headers=headers, timeout=10)
+            ttwid = session.cookies.get("ttwid")
+            cookies = {"ttwid": ttwid} if ttwid else {}
+            
+            api_url = f"https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id={video_id}&device_platform=webapp&aid=6383&channel=channel_pc_web"
+            res = session.get(api_url, headers=headers, cookies=cookies, timeout=10)
+            if res.status_code == 200 and res.text:
+                data = res.json()
+                item = data.get("aweme_detail")
+                if item:
+                    play_urls = item.get("video", {}).get("play_addr", {}).get("url_list", [])
+                    if play_urls:
+                        # Tải video stream
+                        stream_res = requests.get(play_urls[0], headers=headers, stream=True, timeout=30)
+                        if stream_res.status_code == 200:
+                            with open(output_path, "wb") as f:
+                                for chunk in stream_res.iter_content(chunk_size=1024 * 1024):
+                                    if chunk:
+                                        f.write(chunk)
+                            return
+        except Exception as e:
+            print(f"Fallback sang yt-dlp vì lỗi tải trực tiếp: {e}")
+
+    # 3. Fallback dùng yt-dlp
+    ytdlp_cmd = [
+        "yt-dlp",
+        url,
+        "-o", output_path,
+        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "--merge-output-format", "mp4",
+        "--no-playlist",
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    ]
+    res = subprocess.run(ytdlp_cmd, capture_output=True, text=True)
+    if res.returncode != 0 and not Path(output_path).exists():
+        raise RuntimeError(f"Tải video thất bại: {res.stderr[:400]}")
 
 def format_timestamp(seconds: float) -> str:
     """Chuyển đổi giây sang định dạng thời gian SRT HH:MM:SS,mmm."""
@@ -47,32 +122,15 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
     await report_progress("Trích xuất URL Douyin sạch & Khởi tạo task directory", 10, None)
     clean_url = extract_douyin_url(raw_input)
     
-    # Stage 2: 25% - Dùng yt-dlp tải video MP4 gốc
-    await report_progress("Tải video Douyin gốc bằng yt-dlp", 25, {"clean_url": clean_url})
+    # Stage 2: 25% - Dùng yt-dlp tải video MP4 gốc (kèm fallback direct API)
+    await report_progress("Tải video Douyin gốc", 25, {"clean_url": clean_url})
     raw_video_path = task_dir / "raw_video.mp4"
     
-    ytdlp_cmd = [
-        "yt-dlp",
-        clean_url,
-        "-o", str(raw_video_path),
-        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "--merge-output-format", "mp4",
-        "--no-playlist",
-        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    ]
-    
-    process = await asyncio.create_subprocess_exec(
-        *ytdlp_cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await process.communicate()
-    if process.returncode != 0:
-        err_msg = stderr.decode(errors="replace")
-        raise RuntimeError(f"Tải video thất bại: {err_msg[:400]}")
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, download_douyin_video, clean_url, str(raw_video_path))
 
     if not raw_video_path.exists():
-        # Kiểm tra nếu tên file có dạng khác mà yt-dlp sinh ra
+        # Kiểm tra nếu tên file có dạng khác
         mp4_files = list(task_dir.glob("*.mp4"))
         if mp4_files:
             raw_video_path = mp4_files[0]
