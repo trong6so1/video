@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+
+# Data & outputs
+workspace/tasks/*
+!workspace/tasks/.gitkeep
+
+# Logs
+*.log
+
+# Sensitive local config
+.agents/mcp_config.json
