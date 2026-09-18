@@ -253,70 +253,109 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
     subtitle_vi_path = task_dir / "subtitle_vi.srt"
     write_srt(segments_vi, str(subtitle_vi_path))
 
-    # Stage 6: 85% - Tạo giọng lồng tiếng dub_vi.mp3 (Edge-TTS kết hợp fallback gTTS)
-    await report_progress("Tạo giọng lồng tiếng tiếng Việt", 85, None)
-    full_vi_text = " ".join([seg["text"] for seg in segments_vi if seg["text"]])
-    if not full_vi_text.strip():
-        full_vi_text = "Video không có phụ đề."
-
+    # Stage 6: 85% - Tạo giọng lồng tiếng đồng bộ theo mốc thời gian (Timestamp-synchronized dubbing)
+    await report_progress("Tạo giọng lồng tiếng khớp từng mốc thời gian phụ đề", 85, None)
     dub_vi_path = task_dir / "dub_vi.mp3"
-    selected_voice = voice if voice and "NamMinh" in voice else "vi-VN-NamMinhNeural"
+    
+    # 1. Gom các câu phụ đề thành các nhóm thoại tự nhiên có mốc bắt đầu và kết thúc
+    speech_groups = []
+    curr_group_texts = []
+    curr_group_start = None
+    curr_group_end = None
 
-    # Thử tạo bằng Edge-TTS trước (với chunking)
-    generated = False
-    try:
-        words = full_vi_text.split()
-        chunks = []
-        current_chunk = []
-        current_len = 0
-        for w in words:
-            if current_len + len(w) + 1 > 400:
-                chunks.append(" ".join(current_chunk))
-                current_chunk = [w]
-                current_len = len(w)
-            else:
-                current_chunk.append(w)
-                current_len += len(w) + 1
-        if current_chunk:
-            chunks.append(" ".join(current_chunk))
+    for seg in segments_vi:
+        txt = seg.get("text", "").strip()
+        if not txt:
+            continue
+        s_time = seg["start"]
+        e_time = seg["end"]
 
-        chunk_files = []
-        for idx, chunk in enumerate(chunks):
-            c_path = task_dir / f"chunk_{idx}.mp3"
-            communicate = edge_tts.Communicate(chunk, selected_voice)
-            await communicate.save(str(c_path))
-            if c_path.exists() and c_path.stat().st_size > 0:
-                chunk_files.append(c_path)
+        # Nếu khoảng trống giữa các câu > 1.2s hoặc thời lượng nhóm vượt 12s, tách nhóm mới
+        if curr_group_end is not None and (s_time - curr_group_end > 1.2 or (e_time - curr_group_start > 12.0)):
+            speech_groups.append({
+                "start": curr_group_start,
+                "end": curr_group_end,
+                "text": " ".join(curr_group_texts)
+            })
+            curr_group_texts = [txt]
+            curr_group_start = s_time
+            curr_group_end = e_time
+        else:
+            if curr_group_start is None:
+                curr_group_start = s_time
+            curr_group_texts.append(txt)
+            curr_group_end = e_time
 
-        if chunk_files and len(chunk_files) == len(chunks):
-            if len(chunk_files) == 1:
-                chunk_files[0].rename(dub_vi_path)
-            else:
-                concat_list = task_dir / "concat.txt"
-                with open(concat_list, "w", encoding="utf-8") as f:
-                    for cf in chunk_files:
-                        f.write(f"file '{cf.name}'\n")
-                ffmpeg_concat = [
-                    "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                    "-i", str(concat_list),
-                    "-c", "copy",
-                    str(dub_vi_path)
-                ]
-                proc = await asyncio.create_subprocess_exec(*ffmpeg_concat)
-                await proc.communicate()
-            if dub_vi_path.exists() and dub_vi_path.stat().st_size > 0:
-                generated = True
-    except Exception as edge_err:
-        print(f"Edge-TTS failed: {edge_err}, falling back to gTTS...")
+    if curr_group_texts:
+        speech_groups.append({
+            "start": curr_group_start,
+            "end": curr_group_end,
+            "text": " ".join(curr_group_texts)
+        })
 
-    # Fallback gTTS đảm bảo 100% không bao giờ bị lỗi No audio was received
-    if not generated or not dub_vi_path.exists() or dub_vi_path.stat().st_size == 0:
-        def run_gtts():
-            from gtts import gTTS
-            tts = gTTS(text=full_vi_text, lang="vi")
-            tts.save(str(dub_vi_path))
+    # 2. Tạo audio riêng cho từng nhóm thoại, điều chỉnh tốc độ khớp với thời lượng gốc
+    def generate_synced_audio():
+        from gtts import gTTS
+        seg_dir = task_dir / "tts_segs"
+        seg_dir.mkdir(parents=True, exist_ok=True)
+        
+        inputs = []
+        filter_parts = []
+        mix_inputs = []
 
-        await loop.run_in_executor(None, run_gtts)
+        for idx, grp in enumerate(speech_groups):
+            raw_seg_path = seg_dir / f"seg_raw_{idx}.mp3"
+            norm_seg_path = seg_dir / f"seg_norm_{idx}.wav"
+            
+            # Tạo audio qua gTTS
+            tts = gTTS(text=grp["text"], lang="vi")
+            tts.save(str(raw_seg_path))
+            
+            # Tính toán thời lượng audio vừa tạo so với thời lượng video cho phép
+            target_duration = max(grp["end"] - grp["start"], 1.0)
+            probe_cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(raw_seg_path)]
+            probe_res = subprocess.run(probe_cmd, capture_output=True, text=True)
+            try:
+                actual_duration = float(probe_res.stdout.strip())
+            except Exception:
+                actual_duration = target_duration
+            
+            # Nếu nói quá dài so với cảnh, tăng tốc âm thanh (atempo) để khớp miệng/khung hình
+            speed_ratio = actual_duration / target_duration
+            speed_ratio = max(0.8, min(speed_ratio, 1.6)) # Giới hạn tốc độ đọc tự nhiên từ 0.8x đến 1.6x
+            
+            # Chuẩn hóa âm thanh mono 44100Hz và áp dụng atempo
+            speed_cmd = [
+                "ffmpeg", "-y", "-i", str(raw_seg_path),
+                "-filter:a", f"atempo={speed_ratio:.2f}",
+                "-ar", "44100", "-ac", "1",
+                str(norm_seg_path)
+            ]
+            subprocess.run(speed_cmd, capture_output=True)
+
+            delay_ms = int(grp["start"] * 1000)
+            inputs.extend(["-i", str(norm_seg_path)])
+            filter_parts.append(f"[{idx}:a]adelay={delay_ms}|{delay_ms}[a{idx}]")
+            mix_inputs.append(f"[a{idx}]")
+
+        if not inputs:
+            # Fallback nếu không có thoại
+            dummy_cmd = ["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono", "-t", "5", str(dub_vi_path)]
+            subprocess.run(dummy_cmd, capture_output=True)
+            return
+
+        all_mix = "".join(mix_inputs)
+        filter_str = ";".join(filter_parts) + f";{all_mix}amix=inputs={len(speech_groups)}:dropout_transition=0:normalize=0[aout]"
+        merge_cmd = [
+            "ffmpeg", "-y", *inputs,
+            "-filter_complex", filter_str,
+            "-map", "[aout]",
+            "-c:a", "libmp3lame",
+            str(dub_vi_path)
+        ]
+        subprocess.run(merge_cmd, capture_output=True)
+
+    await loop.run_in_executor(None, generate_synced_audio)
 
     # Stage 7: 95% - Ghép audio lồng tiếng, burn hardsub vào output_vi.mp4
     await report_progress("Ghép audio lồng tiếng và nhúng phụ đề vào video", 95, None)
