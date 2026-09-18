@@ -1,18 +1,27 @@
+import os
 import asyncio
 import json
 import uuid
 from pathlib import Path
-from typing import Dict, Any
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from typing import Dict, Any, Optional
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from backend.pipeline import run_pipeline
+from backend.scraper import get_douyin_feed_by_category
 
-app = FastAPI(title="Douyin Translator API", version="1.0.0")
+app = FastAPI(
+    title="Douyin Scraper & Translator API",
+    description="Full-stack API cào video Douyin, dịch tiếng Việt, lồng tiếng và phát SSE realtime.",
+    version="2.0.0"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,13 +37,27 @@ task_states: Dict[str, Dict[str, Any]] = {}
 
 class TranslateRequest(BaseModel):
     douyin_url: str
-    target_voice: str = "vi-VN-HoaiMyNeural"
+    target_voice: Optional[str] = None
+
+@app.get("/api/feed")
+async def get_feed(category: str = Query("food", description="Thể loại: food (Ẩm thực) hoặc funny (Hài hước)")):
+    """Lấy danh sách 10-15 video Douyin theo thể loại."""
+    try:
+        videos = get_douyin_feed_by_category(category=category, limit=15)
+        return {
+            "category": category,
+            "count": len(videos),
+            "videos": videos
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi tải feed video: {str(e)}")
 
 @app.post("/api/translate")
 async def start_translate(req: TranslateRequest, background_tasks: BackgroundTasks):
     if not req.douyin_url or not req.douyin_url.strip():
         raise HTTPException(status_code=400, detail="Vui lòng cung cấp link Douyin.")
 
+    target_voice = req.target_voice or os.getenv("TARGET_VOICE", "vi-VN-HoaiMyNeural")
     task_id = str(uuid.uuid4())[:8]
     queue: asyncio.Queue = asyncio.Queue()
     task_queues[task_id] = queue
@@ -59,7 +82,7 @@ async def start_translate(req: TranslateRequest, background_tasks: BackgroundTas
 
     async def task_runner():
         try:
-            await run_pipeline(task_id, req.douyin_url, req.target_voice, report_progress)
+            await run_pipeline(task_id, req.douyin_url, target_voice, report_progress)
         except Exception as e:
             err_state = {
                 "task_id": task_id,
@@ -72,12 +95,11 @@ async def start_translate(req: TranslateRequest, background_tasks: BackgroundTas
             await queue.put(err_state)
 
     background_tasks.add_task(task_runner)
-    return {"task_id": task_id, "message": "Task đã được tạo thành công."}
+    return {"task_id": task_id, "message": "Task đã được tạo thành công.", "target_voice": target_voice}
 
 @app.get("/api/progress/{task_id}")
 async def get_progress(task_id: str):
     if task_id not in task_queues:
-        # Nếu task đã có sẵn trong state
         if task_id in task_states:
             async def single_event():
                 yield {"data": json.dumps(task_states[task_id], ensure_ascii=False)}
@@ -87,7 +109,6 @@ async def get_progress(task_id: str):
     queue = task_queues[task_id]
 
     async def event_generator():
-        # Gửi ngay state hiện tại nếu có
         current_state = task_states.get(task_id)
         if current_state:
             yield {"data": json.dumps(current_state, ensure_ascii=False)}
@@ -99,7 +120,6 @@ async def get_progress(task_id: str):
                 if state.get("status") in ["completed", "failed"]:
                     break
             except asyncio.TimeoutError:
-                # Gửi heartbeat để giữ kết nối SSE
                 yield {"comment": "keep-alive"}
 
     return EventSourceResponse(event_generator())

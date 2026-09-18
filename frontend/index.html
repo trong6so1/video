@@ -3,92 +3,206 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Douyin Video Translator</title>
+  <title>Douyin Video Scraper & Translator</title>
   <link rel="stylesheet" href="style.css">
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 </head>
 <body>
   <div class="container">
-    <header class="header">
-      <div class="badge">AI Video Pipeline</div>
-      <h1>Douyin Video Translator</h1>
-      <p class="subtitle">Tự động bóc tách âm thanh, nhận diện phụ đề, dịch thuật tiếng Việt và lồng tiếng hoàn chỉnh</p>
+    
+    <!-- Top Global Header -->
+    <header class="app-header">
+      <div class="header-brand">
+        <div class="brand-icon">🎬</div>
+        <div>
+          <div class="brand-title-wrap">
+            <h1 class="brand-title">Douyin Translator Suite</h1>
+            <span class="badge-status">● Live AI Pipeline</span>
+          </div>
+          <p class="brand-desc">Cào video Douyin theo thể loại, bóc tách phụ đề & lồng tiếng AI đồng bộ</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <div class="voice-badge">Giọng AI: Hoài My (Nữ)</div>
+      </div>
     </header>
 
-    <main class="card">
-      <form id="translateForm">
-        <div class="form-group">
-          <label for="douyinUrl">Đường dẫn hoặc đoạn chia sẻ Douyin:</label>
-          <div class="input-wrapper">
-            <input 
-              type="text" 
-              id="douyinUrl" 
-              name="douyinUrl" 
-              placeholder="Dán link Douyin (vd: https://v.douyin.com/... hoặc đoạn văn bản chia sẻ)" 
-              required
-            >
-          </div>
-        </div>
+    <!-- Top Navigation Bar (2 Màn Hình) -->
+    <nav class="main-navbar">
+      <button id="navTabExplore" class="nav-tab active" onclick="switchMainScreen('explore')">
+        <span class="nav-icon">🧭</span>
+        <span class="nav-label">1. Khám phá Video Douyin</span>
+      </button>
+      <button id="navTabTranslate" class="nav-tab" onclick="switchMainScreen('translate')">
+        <span class="nav-icon">⚡</span>
+        <span class="nav-label">2. Dịch Video & Tiến trình</span>
+        <span id="navProcessBadge" class="nav-badge" style="display: none;">Đang dịch</span>
+      </button>
+    </nav>
 
-        <div class="form-row">
-          <div class="form-group half">
-            <label for="voiceSelect">Giọng đọc lồng tiếng (Edge-TTS):</label>
-            <select id="voiceSelect">
-              <option value="vi-VN-NamMinhNeural" selected>Nam Minh (Nam - Chuẩn, Ổn định)</option>
-              <option value="vi-VN-HoaiMyNeural">Hoài My (Nữ)</option>
-            </select>
+    <!-- ======================================================== -->
+    <!-- MÀN HÌNH 1: KHÁM PHÁ VIDEO DOUYIN THEO THỂ LOẠI (GRID) -->
+    <!-- ======================================================== -->
+    <main id="screenExplore" class="screen-view active">
+      <section class="card feed-card">
+        <div class="feed-header">
+          <div>
+            <h2>🔥 Danh sách video Douyin theo thể loại</h2>
+            <p class="text-sub">Chọn một video bên dưới để tự động chuyển sang Màn hình Dịch thuật</p>
           </div>
-          <div class="form-group half action-btn-container">
-            <button type="submit" id="submitBtn" class="btn-primary">
-              <span class="btn-text">Bắt đầu chuyển ngữ</span>
-              <span class="spinner" style="display: none;"></span>
+          
+          <!-- Category Chips -->
+          <div class="category-bar">
+            <button class="cat-btn active" data-category="food" onclick="selectCategory('food')">
+              <span class="cat-icon">🍜</span> Ẩm thực (美食)
+            </button>
+            <button class="cat-btn" data-category="funny" onclick="selectCategory('funny')">
+              <span class="cat-icon">😂</span> Hài hước (搞笑)
             </button>
           </div>
         </div>
-      </form>
 
-      <!-- Progress Section -->
-      <section id="progressSection" class="progress-section" style="display: none;">
+        <!-- Video Grid -->
+        <div id="videoGrid" class="video-grid">
+          <div class="grid-loading">⏳ Đang nạp danh sách video từ Douyin...</div>
+        </div>
+      </section>
+    </main>
+
+    <!-- ======================================================== -->
+    <!-- MÀN HÌNH 2: DỊCH VIDEO & TIẾN TRÌNH XỬ LÝ (TRANSLATE)   -->
+    <!-- ======================================================== -->
+    <main id="screenTranslate" class="screen-view">
+      
+      <!-- Form dán link & Cấu hình -->
+      <section class="card form-card">
+        <div class="form-header">
+          <h2>⚡ Chuyển ngữ & Lồng tiếng Video Douyin</h2>
+          <p class="text-sub">Dán link video tùy chỉnh hoặc nhận video đã chọn từ Màn hình Khám phá</p>
+        </div>
+
+        <form id="translateForm" class="translate-form">
+          <div class="form-group">
+            <label for="douyinUrlInput">Đường dẫn video Douyin:</label>
+            <div class="input-wrapper">
+              <input 
+                type="text" 
+                id="douyinUrlInput" 
+                placeholder="Dán link Douyin (vd: https://www.douyin.com/video/... hoặc https://v.douyin.com/...)" 
+                required
+              >
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group half">
+              <label for="voiceSelect">Giọng đọc lồng tiếng (TTS):</label>
+              <select id="voiceSelect">
+                <option value="vi-VN-HoaiMyNeural" selected>Hoài My (Nữ - Mềm mại, Tự nhiên)</option>
+                <option value="vi-VN-NamMinhNeural">Nam Minh (Nam - Trầm ấm, Rõ ràng)</option>
+              </select>
+            </div>
+            <div class="form-group half action-container">
+              <button type="submit" id="submitBtn" class="btn-primary">
+                <span class="btn-text">Bắt đầu chuyển ngữ ⚡</span>
+                <span class="spinner" style="display: none;"></span>
+              </button>
+            </div>
+          </div>
+        </form>
+      </section>
+
+      <!-- Banner thông tin video đang xử lý -->
+      <section id="selectedVideoBanner" class="card banner-card" style="display: none;">
+        <div class="banner-content">
+          <img id="bannerThumb" src="" alt="Thumbnail" class="banner-img">
+          <div class="banner-details">
+            <span class="banner-tag">Video đang dịch thuật</span>
+            <h3 id="bannerTitle" class="banner-title">Tiêu đề video</h3>
+            <p id="bannerUrl" class="banner-url">https://www.douyin.com/video/...</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Khung tiến trình xử lý SSE 0% -> 100% -->
+      <section id="progressSection" class="card progress-card" style="display: none;">
         <div class="progress-header">
-          <span id="stepLabel" class="step-label">Khởi tạo...</span>
+          <div class="step-info">
+            <span class="pulse-dot"></span>
+            <span id="stepLabel" class="step-label">Khởi tạo tác vụ...</span>
+          </div>
           <span id="percentLabel" class="percent-label">0%</span>
         </div>
+
         <div class="progress-bar-bg">
           <div id="progressBar" class="progress-bar-fill" style="width: 0%;"></div>
         </div>
 
+        <!-- 8 Mốc Giai đoạn -->
         <div class="stage-timeline">
-          <div class="stage-item" data-stage="10">10% Trích xuất link</div>
-          <div class="stage-item" data-stage="25">25% Tải video</div>
-          <div class="stage-item" data-stage="40">40% Tách audio</div>
-          <div class="stage-item" data-stage="60">60% Nhận diện chữ</div>
+          <div class="stage-item" data-stage="10">10% Trích xuất URL</div>
+          <div class="stage-item" data-stage="25">25% Tải video MP4</div>
+          <div class="stage-item" data-stage="40">40% Tách Audio</div>
+          <div class="stage-item" data-stage="60">60% Whisper STT</div>
           <div class="stage-item" data-stage="75">75% Dịch tiếng Việt</div>
-          <div class="stage-item" data-stage="85">85% Tạo giọng đọc</div>
-          <div class="stage-item" data-stage="95">95% Ghép video</div>
+          <div class="stage-item" data-stage="85">85% Lồng tiếng TTS</div>
+          <div class="stage-item" data-stage="95">95% Ghép Hardsub</div>
           <div class="stage-item" data-stage="100">100% Hoàn tất</div>
         </div>
 
+        <!-- Console Log -->
         <div class="log-box">
-          <div class="log-title">Nhật ký xử lý:</div>
+          <div class="log-title">Nhật ký xử lý hệ thống:</div>
           <div id="logContent" class="log-content"></div>
         </div>
       </section>
 
-      <!-- Preview Section -->
-      <section id="previewSection" class="preview-section" style="display: none;">
+      <!-- Khung video thành phẩm (Khi đạt 100%) -->
+      <section id="previewSection" class="card preview-card" style="display: none;">
         <div class="preview-header">
-          <h2>🎉 Video thành phẩm đã sẵn sàng!</h2>
+          <h2>🎉 Video thành phẩm đã hoàn thành!</h2>
+          <p class="text-sub">Video đã được hòa âm lồng tiếng Việt và gắn phụ đề khớp với nhịp nói nhân vật.</p>
         </div>
-        <div class="video-container">
-          <video id="videoPlayer" controls playsinline></video>
-        </div>
-        <div class="preview-actions">
-          <a id="downloadBtn" class="btn-secondary" download="translated_video.mp4">
-            Tải video về máy
-          </a>
+
+        <div class="preview-grid">
+          <div class="video-box">
+            <video id="videoPlayer" controls playsinline></video>
+          </div>
+
+          <div class="preview-info-col">
+            <div id="gitReportBox" class="git-box">
+              <div class="git-header">
+                <span class="git-badge">GitHub & Git</span>
+                <span class="git-title">Tự động nghiệm thu</span>
+              </div>
+              <p id="gitReportText">Đã tự động commit phụ đề .srt vào Git repository.</p>
+            </div>
+
+            <div class="preview-btn-group">
+              <a id="downloadBtn" class="btn-primary full-width" download="douyin_vi.mp4">
+                ⬇ Tải video thành phẩm (MP4)
+              </a>
+              <button id="toggleSubBtn" type="button" class="btn-secondary full-width" onclick="toggleSubtitle()">
+                📝 Xem nội dung phụ đề tiếng Việt (.srt)
+              </button>
+            </div>
+
+            <div id="subContainer" class="sub-container" style="display: none;">
+              <h4>Toàn văn phụ đề subtitle_vi.srt:</h4>
+              <pre id="subText"></pre>
+            </div>
+          </div>
         </div>
       </section>
+
     </main>
+
+    <!-- Footer -->
+    <footer class="app-footer">
+      <p>Douyin Scraper & Translator • Hệ thống tự động hóa Pipeline xử lý Video đa phương tiện</p>
+    </footer>
   </div>
 
   <script src="app.js"></script>

@@ -6,27 +6,45 @@ import uuid
 import datetime
 import urllib.parse
 from pathlib import Path
-from typing import Callable, Awaitable, Optional
+from typing import Callable, Awaitable, Optional, Dict, Any
 import requests
 from faster_whisper import WhisperModel
-from deep_translator import GoogleTranslator
-import edge_tts
+from dotenv import load_dotenv
+
+load_dotenv()
 
 ProgressCallback = Callable[[str, int, Optional[dict]], Awaitable[None]]
 
 def extract_douyin_url(raw_text: str) -> str:
-    """Trích xuất và chuẩn hóa link URL Douyin (bao gồm cả dạng jingxuan?modal_id= và shortlink)."""
-    url_match = re.search(r'(https?://[^\s]+)', raw_text)
+    """
+    Trích xuất và chuẩn hóa link URL Douyin triệt để:
+    - Loại bỏ text thừa khi chia sẻ từ app
+    - Chuyển jingxuan?modal_id=... hoặc ?modal_id=... thành dạng https://www.douyin.com/video/<id>
+    - Chuyển video_id trần sang link đầy đủ
+    """
+    raw_str = raw_text.strip()
+    
+    # Nếu chỉ nhập ID dạng số
+    if raw_str.isdigit():
+        return f"https://www.douyin.com/video/{raw_str}"
+        
+    url_match = re.search(r'(https?://[^\s]+)', raw_str)
     if not url_match:
-        raise ValueError("Không tìm thấy đường dẫn hợp lệ trong chuỗi nhập vào.")
+        raise ValueError("Không tìm thấy đường dẫn URL hợp lệ trong chuỗi nhập vào.")
+    
     url = url_match.group(1).rstrip('/')
     
-    # Chuẩn hóa nếu là URL chứa modal_id (VD: https://www.douyin.com/jingxuan?modal_id=7674948813861211430)
+    # Phân tích query string để tìm modal_id
     parsed = urllib.parse.urlparse(url)
     qs = urllib.parse.parse_qs(parsed.query)
     modal_id = qs.get("modal_id", [None])[0]
     if modal_id:
         return f"https://www.douyin.com/video/{modal_id}"
+    
+    # Kiểm tra nếu là link jingxuan hoặc search có video_id
+    id_match = re.search(r'/(?:video|jingxuan|note)/(\d+)', parsed.path)
+    if id_match:
+        return f"https://www.douyin.com/video/{id_match.group(1)}"
         
     return url
 
@@ -70,7 +88,6 @@ def download_douyin_video(url: str, output_path: str):
                 if item:
                     play_urls = item.get("video", {}).get("play_addr", {}).get("url_list", [])
                     if play_urls:
-                        # Tải video stream
                         stream_res = requests.get(play_urls[0], headers=headers, stream=True, timeout=30)
                         if stream_res.status_code == 200:
                             with open(output_path, "wb") as f:
@@ -114,6 +131,70 @@ def write_srt(segments: list, output_path: str):
             text = seg["text"].strip()
             f.write(f"{idx}\n{start} --> {end}\n{text}\n\n")
 
+def commit_and_create_issue(task_id: str, clean_url: str, srt_content: str) -> Dict[str, Any]:
+    """Tự động Git commit file .srt và mở GitHub Issue báo cáo nếu có cấu hình."""
+    result = {"git_committed": False, "issue_created": False, "issue_url": None, "notes": []}
+    
+    # 1. Git commit .srt
+    try:
+        srt_file = f"workspace/tasks/{task_id}/subtitle_vi.srt"
+        if Path(srt_file).exists():
+            subprocess.run(["git", "add", srt_file], capture_output=True)
+            commit_res = subprocess.run(
+                ["git", "commit", "-m", f"feat(douyin): complete translation for task {task_id}"],
+                capture_output=True,
+                text=True
+            )
+            if commit_res.returncode == 0:
+                result["git_committed"] = True
+                result["notes"].append("Đã git commit file subtitle_vi.srt thành công.")
+            else:
+                result["notes"].append(f"Git commit notice: {commit_res.stdout.strip() or commit_res.stderr.strip()}")
+    except Exception as e:
+        result["notes"].append(f"Lỗi Git commit: {str(e)}")
+
+    # 2. Tạo GitHub Issue nếu có GITHUB_REPO và GITHUB_TOKEN
+    github_repo = os.getenv("GITHUB_REPO", "").strip()
+    github_token = os.getenv("GITHUB_TOKEN", "").strip()
+
+    if github_repo and "/" in github_repo and github_repo != "<owner/repo-name>":
+        issue_title = f"[Completed] Douyin Translation - Task {task_id}"
+        issue_body = f"""### 🎬 Douyin Video Translation Report
+- **Task ID:** `{task_id}`
+- **Thời gian hoàn tất:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+- **Đường dẫn Douyin gốc:** {clean_url}
+- **Thành phẩm video:** `/api/video/{task_id}`
+
+#### 📝 Phụ đề tiếng Việt (`subtitle_vi.srt`):
+```srt
+{srt_content[:3000]}
+```
+*(Tự động tạo bởi Douyin Scraper & Translator Fullstack)*
+"""
+        headers = {
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "Douyin-Translator-App"
+        }
+        if github_token:
+            headers["Authorization"] = f"Bearer {github_token}"
+
+        try:
+            api_url = f"https://api.github.com/repos/{github_repo}/issues"
+            resp = requests.post(api_url, json={"title": issue_title, "body": issue_body}, headers=headers, timeout=10)
+            if resp.status_code in [200, 201]:
+                issue_data = resp.json()
+                result["issue_created"] = True
+                result["issue_url"] = issue_data.get("html_url")
+                result["notes"].append(f"Đã mở GitHub Issue: {result['issue_url']}")
+            else:
+                result["notes"].append(f"Tạo GitHub Issue trả về status {resp.status_code}: {resp.text[:200]}")
+        except Exception as ex:
+            result["notes"].append(f"Lỗi gọi GitHub API: {str(ex)}")
+    else:
+        result["notes"].append("Bỏ qua tạo GitHub Issue vì chưa thiết lập GITHUB_REPO trong .env")
+
+    return result
+
 async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress: ProgressCallback):
     task_dir = Path("workspace/tasks") / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -130,7 +211,6 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
     await loop.run_in_executor(None, download_douyin_video, clean_url, str(raw_video_path))
 
     if not raw_video_path.exists():
-        # Kiểm tra nếu tên file có dạng khác
         mp4_files = list(task_dir.glob("*.mp4"))
         if mp4_files:
             raw_video_path = mp4_files[0]
@@ -158,11 +238,10 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
         raise RuntimeError("Trích xuất audio thất bại.")
 
     # Stage 4: 60% - Chạy Whisper STT bóc tách phụ đề subtitle_zh.srt
-    await report_progress("Chạy Whisper STT bóc tách phụ đề tiếng Trung (mô hình medium)", 60, None)
+    await report_progress("Chạy Whisper STT bóc tách phụ đề tiếng Trung", 60, None)
     
     def transcribe():
-        # Dùng model 'medium' để nhận diện đầy đủ từng câu, không bỏ sót chữ
-        model = WhisperModel("medium", device="cpu", compute_type="int8")
+        model = WhisperModel("base", device="cpu", compute_type="int8")
         segments_raw, _ = model.transcribe(
             str(audio_zh_path),
             language="zh",
@@ -181,10 +260,8 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
                 })
         return seg_list
 
-    loop = asyncio.get_event_loop()
     segments_zh = await loop.run_in_executor(None, transcribe)
     
-    # Trường hợp không nhận diện được lời nói
     if not segments_zh:
         segments_zh = [{"start": 0.0, "end": 2.0, "text": "大家好"}]
 
@@ -257,11 +334,10 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
     subtitle_vi_path = task_dir / "subtitle_vi.srt"
     write_srt(segments_vi, str(subtitle_vi_path))
 
-    # Stage 6: 85% - Tạo giọng lồng tiếng đồng bộ theo cụm phát âm tự nhiên (Natural Speech Clusters)
-    await report_progress("Tạo giọng lồng tiếng đồng bộ chính xác với nhân vật", 85, None)
+    # Stage 6: 85% - Tạo giọng lồng tiếng bằng Edge-TTS / gTTS
+    await report_progress("Tạo giọng lồng tiếng tiếng Việt", 85, None)
     dub_vi_path = task_dir / "dub_vi.mp3"
 
-    # Gom các câu thoại thành các cụm phát âm tự nhiên theo khoảng lặng thoại gốc
     clusters = []
     curr_cluster = []
     for seg in segments_vi:
@@ -270,7 +346,6 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
             continue
         if curr_cluster:
             gap = seg["start"] - curr_cluster[-1]["end"]
-            # Nếu nhân vật dừng nói > 0.4s hoặc cụm thoại dài hơn 7.5s thì tách cụm mới
             if gap > 0.4 or (seg["end"] - curr_cluster[0]["start"] > 7.5):
                 clusters.append({
                     "start": curr_cluster[0]["start"],
@@ -300,7 +375,6 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
         mix_inputs = []
 
         def build_atempo(ratio: float) -> str:
-            # atempo trong ffmpeg từ 0.5 đến 2.0; ghép chuỗi nếu cần tăng tốc cao hơn
             ratio = max(0.65, min(ratio, 3.2))
             filters = []
             curr = ratio
@@ -320,11 +394,10 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
             raw_seg_path = seg_dir / f"cl_raw_{idx}.mp3"
             norm_seg_path = seg_dir / f"cl_norm_{idx}.wav"
             
-            # Tạo audio gTTS cho cụm câu hoàn chỉnh (đầy đủ ngữ điệu tự nhiên)
+            # Tạo audio gTTS
             tts = gTTS(text=txt, lang="vi")
             tts.save(str(raw_seg_path))
             
-            # Tính thời lượng gốc của cụm thoại
             target_duration = max(cl["end"] - cl["start"], 0.8)
             probe_cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(raw_seg_path)]
             probe_res = subprocess.run(probe_cmd, capture_output=True, text=True)
@@ -333,11 +406,9 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
             except Exception:
                 actual_duration = target_duration
             
-            # Khớp tốc độ nói chính xác 1:1 với thời lượng nhân vật nói
             speed_ratio = actual_duration / target_duration
             atempo_filter = build_atempo(speed_ratio)
             
-            # Cắt bỏ khoảng im lặng đầu file (nếu có) và áp dụng atempo
             speed_cmd = [
                 "ffmpeg", "-y", "-i", str(raw_seg_path),
                 "-filter:a", f"silenceremove=start_periods=1:start_duration=0.01:start_threshold=-45dB,{atempo_filter}",
@@ -374,8 +445,6 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
     await report_progress("Ghép audio lồng tiếng và nhúng phụ đề vào video", 95, None)
     output_vi_path = task_dir / "output_vi.mp4"
     
-    # Burn hardsub và hòa âm: giảm nhẹ âm nền và lồng tiếng việt
-    # Chuẩn hóa đường dẫn SRT để tránh escape issue với ffmpeg subtitles filter
     srt_escaped = str(subtitle_vi_path).replace("\\", "/").replace(":", "\\:")
     
     ffmpeg_merge = [
@@ -401,7 +470,6 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
     )
     stdout, stderr = await process.communicate()
     
-    # Fallback nếu burn subtitle filter gặp lỗi phông/filter
     if process.returncode != 0 or not output_vi_path.exists():
         ffmpeg_merge_simple = [
             "ffmpeg", "-y",
@@ -425,10 +493,13 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
     if not output_vi_path.exists():
         raise RuntimeError("Ghép video thành phẩm thất bại.")
 
-    # Stage 8: 100% - Hoàn tất xử lý
+    # Stage 8: 100% - Tự động Commit phụ đề Git & Tạo GitHub Issue Báo cáo
     srt_content = subtitle_vi_path.read_text(encoding="utf-8")
+    git_issue_res = commit_and_create_issue(task_id, clean_url, srt_content)
+    
     await report_progress("Hoàn tất quy trình dịch và lồng tiếng video", 100, {
         "video_url": f"/api/video/{task_id}",
         "srt_content": srt_content,
-        "clean_url": clean_url
+        "clean_url": clean_url,
+        "git_report": git_issue_res
     })

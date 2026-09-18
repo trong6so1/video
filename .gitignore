@@ -5,8 +5,15 @@ __pycache__/
 .venv/
 env/
 
-# Data & outputs
-workspace/tasks/*
+# Environment Variables
+.env
+!.env.example
+
+# Media files & Temp Data (Không commit binary nặng)
+workspace/tasks/*/*.mp4
+workspace/tasks/*/*.wav
+workspace/tasks/*/*.mp3
+workspace/tasks/*/tts_segs/
 !workspace/tasks/.gitkeep
 
 # Logs
