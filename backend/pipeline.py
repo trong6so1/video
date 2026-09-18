@@ -158,24 +158,33 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
         raise RuntimeError("Trích xuất audio thất bại.")
 
     # Stage 4: 60% - Chạy Whisper STT bóc tách phụ đề subtitle_zh.srt
-    await report_progress("Chạy Whisper STT bóc tách phụ đề tiếng Trung", 60, None)
+    await report_progress("Chạy Whisper STT bóc tách phụ đề tiếng Trung (mô hình medium)", 60, None)
     
     def transcribe():
-        model = WhisperModel("small", device="cpu", compute_type="int8")
-        segments_raw, _ = model.transcribe(str(audio_zh_path), language="zh", vad_filter=True)
+        # Dùng model 'medium' để nhận diện đầy đủ từng câu, không bỏ sót chữ
+        model = WhisperModel("medium", device="cpu", compute_type="int8")
+        segments_raw, _ = model.transcribe(
+            str(audio_zh_path),
+            language="zh",
+            beam_size=5,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=250, speech_pad_ms=200)
+        )
         seg_list = []
         for s in segments_raw:
-            seg_list.append({
-                "start": s.start,
-                "end": s.end,
-                "text": s.text.strip()
-            })
+            text = s.text.strip()
+            if text:
+                seg_list.append({
+                    "start": round(s.start, 2),
+                    "end": round(s.end, 2),
+                    "text": text
+                })
         return seg_list
 
     loop = asyncio.get_event_loop()
     segments_zh = await loop.run_in_executor(None, transcribe)
     
-    # Trường hợp không nhận diện được lời nói (ví dụ video chỉ có nhạc nền)
+    # Trường hợp không nhận diện được lời nói
     if not segments_zh:
         segments_zh = [{"start": 0.0, "end": 2.0, "text": "大家好"}]
 
@@ -183,16 +192,15 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
     write_srt(segments_zh, str(subtitle_zh_path))
 
     # Stage 5: 75% - Dịch phụ đề sang tiếng Việt subtitle_vi.srt
-    await report_progress("Dịch phụ đề sang tiếng Việt", 75, None)
+    await report_progress("Dịch phụ đề sang tiếng Việt chuẩn", 75, None)
     
     def translate_texts():
         segments_vi = []
         texts_to_translate = [seg["text"] for seg in segments_zh]
         
-        # Dùng Google Translate API clients5 kết hợp fallback MyMemory
         translated_results = []
-        for i in range(0, len(texts_to_translate), 20):
-            chunk = texts_to_translate[i:i+20]
+        for i in range(0, len(texts_to_translate), 15):
+            chunk = texts_to_translate[i:i+15]
             combined = "\n===\n".join(chunk)
             chunk_translated = None
             try:
@@ -209,14 +217,12 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
                 print(f"Batch translate error: {e}")
 
             if not chunk_translated:
-                # Fallback dịch từng câu
                 chunk_translated = []
                 for c in chunk:
                     if not c.strip():
                         chunk_translated.append("")
                         continue
                     trans_item = None
-                    # Thử clients5
                     try:
                         r = requests.get("https://clients5.google.com/translate_a/t",
                                          params={"client": "dict-chrome-ex", "sl": "zh-CN", "tl": "vi", "q": c},
@@ -227,7 +233,6 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
                     except Exception:
                         pass
                     
-                    # Thử MyMemory nếu vẫn chưa có
                     if not trans_item:
                         try:
                             from deep_translator import MyMemoryTranslator
@@ -248,52 +253,14 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
             })
         return segments_vi
 
-    loop = asyncio.get_event_loop()
     segments_vi = await loop.run_in_executor(None, translate_texts)
     subtitle_vi_path = task_dir / "subtitle_vi.srt"
     write_srt(segments_vi, str(subtitle_vi_path))
 
-    # Stage 6: 85% - Tạo giọng lồng tiếng đồng bộ theo mốc thời gian (Timestamp-synchronized dubbing)
-    await report_progress("Tạo giọng lồng tiếng khớp từng mốc thời gian phụ đề", 85, None)
+    # Stage 6: 85% - Tạo giọng lồng tiếng đồng bộ theo từng câu thoại (Matching từng câu)
+    await report_progress("Tạo giọng lồng tiếng khớp chính xác từng câu thoại", 85, None)
     dub_vi_path = task_dir / "dub_vi.mp3"
-    
-    # 1. Gom các câu phụ đề thành các nhóm thoại tự nhiên có mốc bắt đầu và kết thúc
-    speech_groups = []
-    curr_group_texts = []
-    curr_group_start = None
-    curr_group_end = None
 
-    for seg in segments_vi:
-        txt = seg.get("text", "").strip()
-        if not txt:
-            continue
-        s_time = seg["start"]
-        e_time = seg["end"]
-
-        # Nếu khoảng trống giữa các câu > 1.2s hoặc thời lượng nhóm vượt 12s, tách nhóm mới
-        if curr_group_end is not None and (s_time - curr_group_end > 1.2 or (e_time - curr_group_start > 12.0)):
-            speech_groups.append({
-                "start": curr_group_start,
-                "end": curr_group_end,
-                "text": " ".join(curr_group_texts)
-            })
-            curr_group_texts = [txt]
-            curr_group_start = s_time
-            curr_group_end = e_time
-        else:
-            if curr_group_start is None:
-                curr_group_start = s_time
-            curr_group_texts.append(txt)
-            curr_group_end = e_time
-
-    if curr_group_texts:
-        speech_groups.append({
-            "start": curr_group_start,
-            "end": curr_group_end,
-            "text": " ".join(curr_group_texts)
-        })
-
-    # 2. Tạo audio riêng cho từng nhóm thoại, điều chỉnh tốc độ khớp với thời lượng gốc
     def generate_synced_audio():
         from gtts import gTTS
         seg_dir = task_dir / "tts_segs"
@@ -303,16 +270,19 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
         filter_parts = []
         mix_inputs = []
 
-        for idx, grp in enumerate(speech_groups):
+        for idx, seg in enumerate(segments_vi):
+            txt = seg["text"].strip()
+            if not txt:
+                continue
             raw_seg_path = seg_dir / f"seg_raw_{idx}.mp3"
             norm_seg_path = seg_dir / f"seg_norm_{idx}.wav"
             
-            # Tạo audio qua gTTS
-            tts = gTTS(text=grp["text"], lang="vi")
+            # Tạo giọng đọc cho từng câu riêng biệt
+            tts = gTTS(text=txt, lang="vi")
             tts.save(str(raw_seg_path))
             
-            # Tính toán thời lượng audio vừa tạo so với thời lượng video cho phép
-            target_duration = max(grp["end"] - grp["start"], 1.0)
+            # Tính toán thời lượng gốc của câu thoại
+            target_duration = max(seg["end"] - seg["start"], 0.8)
             probe_cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(raw_seg_path)]
             probe_res = subprocess.run(probe_cmd, capture_output=True, text=True)
             try:
@@ -320,11 +290,10 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
             except Exception:
                 actual_duration = target_duration
             
-            # Nếu nói quá dài so với cảnh, tăng tốc âm thanh (atempo) để khớp miệng/khung hình
+            # Điều chỉnh tốc độ (atempo) để câu tiếng Việt khớp vừa vặn với câu gốc
             speed_ratio = actual_duration / target_duration
-            speed_ratio = max(0.8, min(speed_ratio, 1.6)) # Giới hạn tốc độ đọc tự nhiên từ 0.8x đến 1.6x
+            speed_ratio = max(0.85, min(speed_ratio, 1.75))
             
-            # Chuẩn hóa âm thanh mono 44100Hz và áp dụng atempo
             speed_cmd = [
                 "ffmpeg", "-y", "-i", str(raw_seg_path),
                 "-filter:a", f"atempo={speed_ratio:.2f}",
@@ -333,19 +302,18 @@ async def run_pipeline(task_id: str, raw_input: str, voice: str, report_progress
             ]
             subprocess.run(speed_cmd, capture_output=True)
 
-            delay_ms = int(grp["start"] * 1000)
+            delay_ms = int(seg["start"] * 1000)
             inputs.extend(["-i", str(norm_seg_path)])
-            filter_parts.append(f"[{idx}:a]adelay={delay_ms}|{delay_ms}[a{idx}]")
+            filter_parts.append(f"[{len(inputs)//2 - 1}:a]adelay={delay_ms}|{delay_ms}[a{idx}]")
             mix_inputs.append(f"[a{idx}]")
 
-        if not inputs:
-            # Fallback nếu không có thoại
+        if not mix_inputs:
             dummy_cmd = ["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono", "-t", "5", str(dub_vi_path)]
             subprocess.run(dummy_cmd, capture_output=True)
             return
 
         all_mix = "".join(mix_inputs)
-        filter_str = ";".join(filter_parts) + f";{all_mix}amix=inputs={len(speech_groups)}:dropout_transition=0:normalize=0[aout]"
+        filter_str = ";".join(filter_parts) + f";{all_mix}amix=inputs={len(mix_inputs)}:dropout_transition=0:normalize=0[aout]"
         merge_cmd = [
             "ffmpeg", "-y", *inputs,
             "-filter_complex", filter_str,
